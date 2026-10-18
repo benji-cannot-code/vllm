@@ -9,7 +9,8 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -178,6 +179,23 @@ class DeepseekV32Attention(MLAAttention):
 
         num_hidden_layers = getattr(config, "num_hidden_layers", None)
         is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
+
+        # The top-k buffer isn't sent between pipeline stages, so a stage that
+        # started on a layer reusing the previous layer's top-k would attend to
+        # whatever the buffer held, silently.
+        pp_group = get_pp_group()
+        if skip_topk and pp_group.world_size > 1:
+            stage_start, _ = get_pp_indices(
+                config.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            if layer_id == stage_start:
+                raise ValueError(
+                    f"Pipeline stage {pp_group.rank_in_group} starts at layer "
+                    f"{layer_id}, which reuses the previous layer's top-k, but the "
+                    "top-k isn't sent between stages. Set VLLM_PP_LAYER_PARTITION "
+                    "so that every stage starts on a layer that computes its own "
+                    "top-k (for GLM-5.3 on 4 stages: 18,20,20,20)."
+                )
 
         kv_b_proj = ColumnParallelLinear(
             kv_lora_rank,
